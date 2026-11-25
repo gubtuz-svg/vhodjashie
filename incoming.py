@@ -1,15 +1,28 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
+import glob
 import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from PIL import Image, ImageTk
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ---------- Пути: рядом с .exe (если собран) или рядом с .py ----------
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DB_PATH = os.path.join(BASE_DIR, "incoming.db")
 SCANS_DIR = os.path.join(BASE_DIR, "scans")
 os.makedirs(SCANS_DIR, exist_ok=True)
+
+def _clean_filename(s: str) -> str:
+    bad = '\\/:*?"<>|'
+    for ch in bad:
+        s = s.replace(ch, "-")
+    return s.strip() or "БезНомера"
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -33,7 +46,7 @@ def get_conn():
 # ---------- Сканирование (JPG, с опцией Ч/Б) ----------
 def save_jpg(img: Image.Image, path: str, bw: bool):
     if bw:
-        img = img.convert("L")  # оттенки серого
+        img = img.convert("L")
     else:
         img = img.convert("RGB")
     img.save(path, "JPEG", quality=85)
@@ -52,7 +65,6 @@ def scan_twain_jpg(prefix: str, bw: bool, dpi=300):
             sm.destroy(); return files
         src.SetCapability(twain.ICAP_XRESOLUTION, twain.TWTY_FIX32, float(dpi))
         src.SetCapability(twain.ICAP_YRESOLUTION, twain.TWTY_FIX32, float(dpi))
-        # Ч/Б -> 0 (BW), иначе 2 (RGB)
         src.SetCapability(twain.ICAP_PIXELTYPE, twain.TWTY_UINT16, 0 if bw else 2)
         src.RequestAcquire(0, 0)
         page = 1
@@ -112,7 +124,7 @@ class ScanViewer(tk.Toplevel):
         self.files = [f for f in files if os.path.exists(f)]
         self.idx = 0
         self.zoom = 1.0
-        self.rotation = 0  # 0, 90, 180, 270
+        self.rotation = 0
         self._photo = None
 
         top = ttk.Frame(self); top.pack(fill="x", padx=6, pady=4)
@@ -176,7 +188,7 @@ class ScanViewer(tk.Toplevel):
             return
         try:
             img = Image.open(f)
-            img = img.rotate(-self.rotation, expand=True)  # PIL: против часовой; у нас по часовой
+            img = img.rotate(-self.rotation, expand=True)
             img.save(f, "JPEG", quality=85)
             self.rotation = 0
             self.render()
@@ -185,7 +197,6 @@ class ScanViewer(tk.Toplevel):
             messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
 
     def print_scan(self):
-        """Собирает все страницы скана в Word и открывает для печати."""
         if not self.files:
             return
         try:
@@ -195,7 +206,6 @@ class ScanViewer(tk.Toplevel):
             messagebox.showerror("Нужен модуль python-docx", "Выполните: pip install python-docx")
             return
         doc = Document()
-        # убираем поля, чтобы картинка была крупнее
         for section in doc.sections:
             section.top_margin = Cm(1)
             section.bottom_margin = Cm(1)
@@ -204,7 +214,6 @@ class ScanViewer(tk.Toplevel):
         for f in self.files:
             try:
                 img = Image.open(f)
-                # применяем текущий поворот к текущей странице (если она открыта)
                 if f == self.files[self.idx] and self.rotation:
                     img = img.rotate(-self.rotation, expand=True)
                 tmp = os.path.join(SCANS_DIR, f"_print_{datetime.now().timestamp()}.jpg")
@@ -240,7 +249,6 @@ class ScanViewer(tk.Toplevel):
             return
         if self.rotation:
             img = img.rotate(-self.rotation, expand=True)
-
         cw = max(self.canvas.winfo_width(), 200)
         ch = max(self.canvas.winfo_height(), 200)
         w, h = img.size
@@ -291,7 +299,6 @@ class App(tk.Tk):
         ttk.Button(btns, text="Очистить форму", command=self.clear_form).pack(side="left", padx=3)
         ttk.Button(btns, text="Удалить выбранное", command=self.delete_record).pack(side="left", padx=3)
 
-        # Сканирование с флажком Ч/Б
         scan_frame = ttk.Frame(form)
         scan_frame.grid(row=4, column=0, columnspan=6, pady=4, sticky="w")
         ttk.Button(scan_frame, text="📠 Сканировать (JPG)", command=self.scan_current).pack(side="left", padx=3)
@@ -405,14 +412,28 @@ class App(tk.Tk):
         if self.selected_id is None:
             messagebox.showinfo("Инфо", "Сначала выберите запись (или добавьте её), к которой прикрепить скан.")
             return
+
         row = self.conn.execute("SELECT in_number, in_date FROM documents WHERE id=?", (self.selected_id,)).fetchone()
-        safe_num = "".join(ch for ch in (row[0] or "doc") if ch.isalnum() or ch in "-_") or "doc"
-        prefix = os.path.join(SCANS_DIR, f"{row[1] or 'nodate'}_{safe_num}_{self.selected_id}".replace(":", "-"))
+        raw_num = (row[0] or "БезНомера").strip()
+        raw_date = (row[1] or "безДаты").strip()
+
+        safe_num = _clean_filename(raw_num)
+        safe_date = _clean_filename(raw_date)
+
+        prefix = os.path.join(SCANS_DIR, f"{safe_num}_{safe_date}")
+
+        # удаляем старые JPG с этим же префиксом
+        for old in glob.glob(prefix + "_*.jpg"):
+            try:
+                os.remove(old)
+            except Exception:
+                pass
 
         bw = self.bw_var.get()
         messagebox.showinfo("Сканирование",
                             f"Откроется окно сканера (Epson Scan / WIA).\n"
                             f"Режим: {'Ч/Б' if bw else 'Цветной'}\n"
+                            f"Имя файла: {os.path.basename(prefix)}_N.jpg\n"
                             f"Отсканируйте страницы и подтвердите.")
         files = do_scan_jpg(prefix, bw)
         if files:
@@ -439,7 +460,6 @@ class App(tk.Tk):
         ScanViewer(self, files)
 
     def delete_scan(self):
-        """Удаляет файлы скана у выбранной записи и очищает поле в базе."""
         if self.selected_id is None:
             messagebox.showinfo("Инфо", "Выберите запись в таблице.")
             return
