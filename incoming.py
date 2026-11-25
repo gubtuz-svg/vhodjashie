@@ -613,4 +613,133 @@ class App(tk.Tk):
                               (";".join(files), self.selected_id))
             self.conn.commit()
             self.load_data()
-            if messagebox.askyesno("Готово", f"Сохранено страниц: {len(files)}.\n\nОткрыть прос
+            if messagebox.askyesno("Готово", f"Сохранено страниц: {len(files)}.\n\nОткрыть просмотр?"):
+                self.open_scan()
+        else:
+            messagebox.showerror("Ошибка", "Сканирование не выполнено.\nПроверьте драйвер Epson / TWAIN / WIA.")
+
+    def open_scan(self):
+        if self.selected_id is None:
+            messagebox.showinfo("Инфо", "Выберите запись в таблице."); return
+        row = self.conn.execute("SELECT scan_path FROM documents WHERE id=?", (self.selected_id,)).fetchone()
+        if not row or not row[0]:
+            messagebox.showinfo("Инфо", "У этой записи нет скана."); return
+        files = [p for p in row[0].split(";") if p and os.path.exists(p)]
+        if not files:
+            messagebox.showinfo("Инфо", "Файлы скана не найдены на диске."); return
+        ScanViewer(self, files)
+
+    def delete_scan(self):
+        if self.selected_id is None:
+            messagebox.showinfo("Инфо", "Выберите запись в таблице."); return
+        row = self.conn.execute("SELECT scan_path FROM documents WHERE id=?", (self.selected_id,)).fetchone()
+        if not row or not row[0]:
+            messagebox.showinfo("Инфо", "У этой записи нет скана."); return
+        files = [p for p in row[0].split(";") if p]
+        if not messagebox.askyesno("Удаление скана",
+                f"Удалить скан?\nФайлов: {len(files)}\nФайлы будут удалены безвозвратно."):
+            return
+        deleted, errors = 0, []
+        for f in files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f); deleted += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(f)}: {e}")
+        self.conn.execute("UPDATE documents SET scan_path=NULL WHERE id=?", (self.selected_id,))
+        self.conn.commit()
+        self.load_data()
+        msg = f"Удалено файлов: {deleted}"
+        if errors: msg += "\n\nОшибки:\n" + "\n".join(errors)
+        messagebox.showinfo("Готово", msg)
+
+    def open_scans_folder(self):
+        os.startfile(SCANS_DIR)
+
+    # ---------- Печать ----------
+    def _make_word_file(self, rows, title, one=False):
+        try:
+            from docx import Document
+            from docx.shared import Pt
+        except ImportError:
+            messagebox.showerror("Нужен модуль python-docx", "Выполните: pip install python-docx"); return
+        doc = Document()
+        doc.add_heading(title, level=1)
+        if one:
+            r = rows[0]
+            pairs = [("Входящий номер", r[1]), ("Дата", r[2]), ("От кого", r[3]),
+                     ("Для чего / кратко", r[4]), ("Дело", r[5]), ("Примечание", r[6])]
+            for k, v in pairs:
+                p = doc.add_paragraph()
+                p.add_run(f"{k}: ").bold = True
+                p.add_run(str(v) if v else "—")
+            scan = r[7] if len(r) > 7 else ""
+            if scan:
+                p = doc.add_paragraph()
+                p.add_run("Скан: ").bold = True
+                p.add_run(scan)
+        else:
+            table = doc.add_table(rows=1, cols=7)
+            table.style = "Table Grid"
+            hdr = ["№", "Вх. №", "Дата", "От кого", "Для чего", "Дело", "Примечание"]
+            for i, h in enumerate(hdr):
+                cell = table.rows[0].cells[i]
+                cell.text = h
+                cell.paragraphs[0].runs[0].bold = True
+            for idx, r in enumerate(rows, 1):
+                cells = table.add_row().cells
+                cells[0].text = str(idx)
+                for i, val in enumerate(r[1:7], 1):
+                    cells[i].text = str(val) if val else ""
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.font.size = Pt(9)
+        out = filedialog.asksaveasfilename(defaultextension=".docx",
+            filetypes=[("Word документ", "*.docx")], initialfile="Печать_входящих.docx")
+        if not out: return
+        doc.save(out)
+        messagebox.showinfo("Готово", f"Файл сохранён:\n{out}\n\nОткройте и нажмите Ctrl+P.")
+        try: os.startfile(out)
+        except: pass
+
+    def print_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Инфо", "Выберите запись."); return
+        vals = self.tree.item(sel[0], "values")
+        row = self.conn.execute("SELECT * FROM documents WHERE id=?", (int(vals[0]),)).fetchone()
+        self._make_word_file([row], "Входящий документ", one=True)
+
+    def print_all(self):
+        rows = self.conn.execute(f"SELECT * FROM documents ORDER BY {self.sort_col} "
+                                 f"{'DESC' if self.sort_desc else 'ASC'}, id DESC").fetchall()
+        if not rows:
+            messagebox.showinfo("Инфо", "Журнал пуст."); return
+        self._make_word_file(rows, "Журнал входящей документации")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()name: Build EXE
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow python-docx pytwain pywin32
+      - run: pyinstaller --onefile --noconsole --name "Входящие" incoming.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vhodjashie-EXE
+          path: dist/Входящие.exe
