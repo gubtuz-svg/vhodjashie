@@ -7,6 +7,7 @@ import glob
 import zipfile
 import sqlite3
 import calendar
+import shutil
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, date
@@ -23,29 +24,47 @@ SCANS_DIR = os.path.join(BASE_DIR, "scans")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 os.makedirs(SCANS_DIR, exist_ok=True)
 
+# ---------- OCR ----------
+def find_tesseract():
+    p = shutil.which("tesseract")
+    if p: return p
+    for cand in [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                 r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]:
+        if os.path.exists(cand): return cand
+    return None
+TESSERACT_PATH = find_tesseract()
+
+def ocr_image(img_path, lang="rus+eng"):
+    if not TESSERACT_PATH: return ""
+    try:
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        return pytesseract.image_to_string(Image.open(img_path), lang=lang).strip()
+    except Exception as e:
+        print("OCR error:", e)
+        return ""
+
 # ---------- Настройки ----------
-DEFAULT_SETTINGS = {
-    "theme": "light", "paper": "A4 (210×297)", "dpi": "300",
-    "bw": False, "win_geom": "1280x760", "last_dir": "",
-    "autobackup_days": 7,
-}
+DEFAULT_SETTINGS = {"theme":"light","paper":"A4 (210×297)","dpi":"300",
+                    "bw":False,"win_geom":"1280x760","last_dir":"",
+                    "autobackup_days":7,"scan_format":"JPG"}
 def load_settings():
     if os.path.exists(SETTINGS_PATH):
         try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            with open(SETTINGS_PATH,"r",encoding="utf-8") as f:
                 d = json.load(f)
-            for k, v in DEFAULT_SETTINGS.items(): d.setdefault(k, v)
+            for k,v in DEFAULT_SETTINGS.items(): d.setdefault(k,v)
             return d
         except: pass
     return dict(DEFAULT_SETTINGS)
 def save_settings(d):
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(SETTINGS_PATH,"w",encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
     except: pass
 SETTINGS = load_settings()
 
-# ---------- Цвета (2 темы) ----------
+# ---------- Темы ----------
 THEMES = {
     "light": {"bg":"#F4F6FB","card":"#FFFFFF","accent":"#4A6CF7","accent_h":"#3A56C8",
               "text":"#1F2937","muted":"#6B7280","row_alt":"#F9FAFF","danger":"#E5484D",
@@ -55,12 +74,11 @@ THEMES = {
               "heading":"#33334D","sel":"#3B4A7A","border":"#3A3A52"},
 }
 C = THEMES.get(SETTINGS.get("theme","light"), THEMES["light"])
-FONT_MAIN = ("Segoe UI",10); FONT_BOLD = ("Segoe UI",10,"bold")
-FONT_TITLE = ("Segoe UI",16,"bold"); FONT_SMALL = ("Segoe UI",9)
+FONT_MAIN=("Segoe UI",10); FONT_BOLD=("Segoe UI",10,"bold")
+FONT_TITLE=("Segoe UI",16,"bold"); FONT_SMALL=("Segoe UI",9)
 
 def _clean_filename(s):
-    for ch in '\\/:*?"<>|':
-        s = s.replace(ch,"-")
+    for ch in '\\/:*?"<>|': s = s.replace(ch,"-")
     return s.strip().strip(".") or "БезНазвания"
 
 # ---------- БД ----------
@@ -76,31 +94,36 @@ def get_conn():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()]
     for col, defv in [("scan_path","TEXT"),("status","TEXT DEFAULT 'Новый'"),
                       ("executor","TEXT"),("remind_date","TEXT"),
-                      ("created_at","TEXT"),("deleted","INTEGER DEFAULT 0")]:
+                      ("created_at","TEXT"),("deleted","INTEGER DEFAULT 0"),
+                      ("ocr_text","TEXT")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {defv}")
     conn.commit()
     return conn
 
 # ---------- Календарь ----------
+RU_MONTHS = ["Январь","Февраль","Март","Апрель","Май","Июнь",
+             "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
+RU_DAYS = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+
 class DatePicker(tk.Toplevel):
     def __init__(self, master, var):
         super().__init__(master)
         self.var = var; self.title("Выбор даты"); self.resizable(False, False)
-        self.configure(bg=C["card"]); self.transient(master); self.grab_set()
-        try:
-            cur = datetime.strptime(var.get(), "%Y-%m-%d").date()
+        self.configure(bg=C["card"]); self.transient(master)
+        try: cur = datetime.strptime(var.get(),"%Y-%m-%d").date()
         except: cur = date.today()
         self.year, self.month = cur.year, cur.month
-        self.top = tk.Frame(self, bg=C["card"]); self.top.pack(pady=8, padx=8, fill="x")
+        self.day_selected = cur
+        self.top = tk.Frame(self, bg=C["card"]); self.top.pack(pady=8, padx=10, fill="x")
         tk.Button(self.top, text="◀", command=self.prev_m, bg=C["accent"], fg="white",
                   relief="flat", width=3, cursor="hand2").pack(side="left")
         self.lbl = tk.Label(self.top, text="", bg=C["card"], fg=C["text"], font=FONT_BOLD)
         self.lbl.pack(side="left", expand=True, fill="x")
         tk.Button(self.top, text="▶", command=self.next_m, bg=C["accent"], fg="white",
                   relief="flat", width=3, cursor="hand2").pack(side="right")
-        self.grid_frame = tk.Frame(self, bg=C["card"]); self.grid_frame.pack(padx=8, pady=4)
-        bot = tk.Frame(self, bg=C["card"]); bot.pack(pady=6, padx=8, fill="x")
+        self.grid_frame = tk.Frame(self, bg=C["card"]); self.grid_frame.pack(padx=10, pady=4)
+        bot = tk.Frame(self, bg=C["card"]); bot.pack(pady=8, padx=10, fill="x")
         tk.Button(bot, text="Сегодня", command=self.today, bg=C["accent"], fg="white",
                   relief="flat", padx=10, cursor="hand2").pack(side="left")
         tk.Button(bot, text="Очистить", command=self.clear, bg=C["muted"], fg="white",
@@ -108,21 +131,27 @@ class DatePicker(tk.Toplevel):
         tk.Button(bot, text="Закрыть", command=self.destroy, bg=C["danger"], fg="white",
                   relief="flat", padx=10, cursor="hand2").pack(side="right")
         self.render()
+        self.after(50, lambda: self._focus())
+    def _focus(self):
+        try: self.grab_set(); self.focus_force()
+        except: pass
     def render(self):
         for w in self.grid_frame.winfo_children(): w.destroy()
-        self.lbl.config(text=f"{calendar.month_name[self.month]} {self.year}")
-        for i, d in enumerate(["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]):
+        self.lbl.config(text=f"{RU_MONTHS[self.month-1]} {self.year}")
+        for i,d in enumerate(RU_DAYS):
             tk.Label(self.grid_frame, text=d, bg=C["card"], fg=C["muted"],
-                     font=FONT_SMALL).grid(row=0, column=i, padx=3, pady=3)
+                     font=FONT_SMALL, width=4).grid(row=0, column=i, padx=2, pady=3)
         for r, week in enumerate(calendar.monthcalendar(self.year, self.month), 1):
             for c, day in enumerate(week):
                 if day == 0: continue
+                is_today = (date.today() == date(self.year, self.month, day))
+                is_sel = (self.day_selected == date(self.year, self.month, day))
+                bg = C["accent"] if (is_today or is_sel) else C["card"]
+                fg = "white" if (is_today or is_sel) else C["text"]
                 b = tk.Button(self.grid_frame, text=str(day), width=4, relief="flat",
-                              bg=C["card"], fg=C["text"], cursor="hand2",
+                              bg=bg, fg=fg, cursor="hand2",
                               command=lambda d=day: self.pick(d))
                 b.grid(row=r, column=c, padx=1, pady=1)
-                if date.today() == date(self.year, self.month, day):
-                    b.config(bg=C["accent"], fg="white")
     def prev_m(self):
         self.month -= 1
         if self.month < 1: self.month = 12; self.year -= 1
@@ -143,6 +172,7 @@ def save_jpg(img, path, bw):
 PAPER_SIZES = {"A4 (210×297)":(8.27,11.69),"A5 (148×210)":(5.83,8.27),
                "Letter (8.5×11)":(8.5,11.0),"Legal (8.5×14)":(8.5,14.0),
                "Авто (по краю)":None}
+
 def scan_twain_jpg(prefix, bw, dpi, paper):
     files = []
     try:
@@ -179,6 +209,7 @@ def scan_twain_jpg(prefix, bw, dpi, paper):
         src.CloseSource(); sm.destroy()
     except Exception as e: print("TWAIN error:", e)
     return files
+
 def scan_wia_jpg(prefix, bw):
     files = []
     try:
@@ -193,9 +224,25 @@ def scan_wia_jpg(prefix, bw):
         except: pass
     except Exception as e: print("WIA error:", e)
     return files
-def do_scan_jpg(prefix, bw, dpi, paper):
+
+def do_scan(prefix, bw, dpi, paper, fmt="JPG"):
     files = scan_twain_jpg(prefix, bw, dpi, paper)
     if not files: files = scan_wia_jpg(prefix, bw)
+    if not files: return []
+    if fmt in ("PDF","PDF + JPG"):
+        pdf_path = f"{prefix}.pdf"
+        try:
+            imgs = [Image.open(f).convert("RGB") for f in files]
+            imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], resolution=dpi)
+        except Exception as e:
+            print("PDF error:", e); pdf_path = None
+        if fmt == "PDF":
+            for f in files:
+                try: os.remove(f)
+                except: pass
+            return [pdf_path] if pdf_path else []
+        else:
+            return files + ([pdf_path] if pdf_path else [])
     return files
 
 # ---------- Просмотр ----------
@@ -203,8 +250,27 @@ class ScanViewer(tk.Toplevel):
     def __init__(self, master, files):
         super().__init__(master)
         self.title("Просмотр скана"); self.geometry("960x740"); self.configure(bg=C["bg"])
-        self.files = [f for f in files if os.path.exists(f)]
-        self.idx = 0; self.zoom = 1.0; self.rotation = 0; self._photo = None
+        self._photo = None; self.idx = 0; self.zoom = 1.0; self.rotation = 0
+        # Поддержка PDF
+        self.files = []
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                try:
+                    from pdf2image import convert_from_path
+                    pages = convert_from_path(f, dpi=150)
+                    base = os.path.splitext(f)[0]
+                    for i, pg in enumerate(pages, 1):
+                        jpg = f"{base}_pdfpage_{i}.jpg"
+                        pg.save(jpg, "JPEG", quality=85)
+                        self.files.append(jpg)
+                except Exception as e:
+                    print("PDF preview error:", e)
+                    messagebox.showerror("PDF","Для просмотра PDF установите Poppler:\n"
+                        "https://github.com/oschwartz10612/poppler-windows/releases\n\n"
+                        f"Ошибка: {e}")
+            else:
+                self.files.append(f)
+        self.files = [f for f in self.files if os.path.exists(f)]
         bar = tk.Frame(self, bg=C["card"]); bar.pack(fill="x", padx=8, pady=6)
         def btn(txt, cmd, bg=None):
             return tk.Button(bar, text=txt, command=cmd, bg=bg or C["accent"], fg="white",
@@ -230,7 +296,7 @@ class ScanViewer(tk.Toplevel):
         self.canvas.bind("<MouseWheel>", self.on_wheel)
         self.canvas.bind("<Configure>", lambda e: self.render())
         if not self.files:
-            messagebox.showinfo("Просмотр", "Файлы скана не найдены."); self.destroy(); return
+            messagebox.showinfo("Просмотр","Файлы не найдены."); self.destroy(); return
         self.render()
     def change_zoom(self, k):
         self.zoom = max(0.1, min(4.0, self.zoom*k))
@@ -249,7 +315,7 @@ class ScanViewer(tk.Toplevel):
         try:
             Image.open(f).rotate(-self.rotation, expand=True).save(f,"JPEG",quality=85)
             self.rotation = 0; self.render(); messagebox.showinfo("Готово","Поворот сохранён.")
-        except Exception as e: messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
+        except Exception as e: messagebox.showerror("Ошибка", f"Не удалось: {e}")
     def print_scan(self):
         if not self.files: return
         try:
@@ -270,11 +336,11 @@ class ScanViewer(tk.Toplevel):
                 try: os.remove(tmp)
                 except: pass
                 doc.add_page_break()
-            except Exception as e: print("print err:", e)
+            except Exception as e: print("print:", e)
         out = filedialog.asksaveasfilename(defaultextension=".docx",
             filetypes=[("Word","*.docx")], initialfile="Скан_для_печати.docx")
         if not out: return
-        doc.save(out); messagebox.showinfo("Готово", f"Сохранено:\n{out}\n\nОткройте и Ctrl+P.")
+        doc.save(out); messagebox.showinfo("Готово", f"Сохранено:\n{out}\n\nCtrl+P.")
         try: os.startfile(out)
         except: pass
     def render(self):
@@ -291,8 +357,7 @@ class ScanViewer(tk.Toplevel):
         scale = fit*self.zoom; nw, nh = max(1,int(w*scale)), max(1,int(h*scale))
         img = img.resize((nw, nh), Image.LANCZOS)
         self._photo = ImageTk.PhotoImage(img)
-        self.canvas.create_image(cw//2, ch//2, image=self._photo, anchor="center")
-# ---------- Главное окно ----------
+        self.canvas.create_image(cw//2, ch//2, image=self._photo, anchor="center")# ---------- Главное окно ----------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -306,14 +371,19 @@ class App(tk.Tk):
         self.sort_col = "in_date"
         self.sort_desc = True
         self.filter_noscan = tk.BooleanVar(value=False)
+        self._autocomplete_widgets = {}
         self._build_ui()
         self._bind_hotkeys()
         self.load_data()
         self._check_reminders()
         self._autobackup()
+        if not TESSERACT_PATH:
+            self.after(800, lambda: messagebox.showwarning(
+                "OCR не настроен",
+                "Tesseract OCR не найден.\nПоиск по содержимому скана будет недоступен.\n"
+                "Установите Tesseract: https://github.com/UB-Mannheim/tesseract/wiki"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------- Стиль ----------
     def _apply_style(self):
         style = ttk.Style(self)
         try: style.theme_use("clam")
@@ -335,10 +405,12 @@ class App(tk.Tk):
         style.configure("Ghost.TButton", background=C["heading"], foreground=C["accent"],
                         borderwidth=0, padding=(12,8), font=FONT_MAIN)
         style.map("Ghost.TButton", background=[("active", C["heading"])])
-        style.configure("Danger.TButton", background="#FEE2E2" if SETTINGS["theme"]=="light" else "#4A1D1D",
-                        foreground=C["danger"], borderwidth=0, padding=(12,8), font=FONT_MAIN)
-        style.configure("Success.TButton", background="#DCFCE7" if SETTINGS["theme"]=="light" else "#1A3A24",
-                        foreground="#166534" if SETTINGS["theme"]=="light" else "#86EFAC",
+        danger_bg = "#FEE2E2" if SETTINGS["theme"]=="light" else "#4A1D1D"
+        style.configure("Danger.TButton", background=danger_bg, foreground=C["danger"],
+                        borderwidth=0, padding=(12,8), font=FONT_MAIN)
+        success_bg = "#DCFCE7" if SETTINGS["theme"]=="light" else "#1A3A24"
+        success_fg = "#166534" if SETTINGS["theme"]=="light" else "#86EFAC"
+        style.configure("Success.TButton", background=success_bg, foreground=success_fg,
                         borderwidth=0, padding=(12,8), font=FONT_MAIN)
         style.configure("Treeview", background=C["card"], fieldbackground=C["card"],
                         foreground=C["text"], rowheight=28, borderwidth=0, font=FONT_MAIN)
@@ -347,7 +419,6 @@ class App(tk.Tk):
         style.map("Treeview.Heading", background=[("active", C["heading"])])
         style.map("Treeview", background=[("selected", C["sel"])], foreground=[("selected", C["text"])])
 
-    # ---------- Интерфейс ----------
     def _build_ui(self):
         header = tk.Frame(self, bg=C["bg"]); header.pack(fill="x", padx=16, pady=(12,4))
         tk.Label(header, text="📥  Входящая документация", bg=C["bg"], fg=C["text"],
@@ -363,7 +434,6 @@ class App(tk.Tk):
         ttk.Button(header, text="📥 Импорт CSV", style="Ghost.TButton",
                    command=self.import_csv).pack(side="right", padx=4)
 
-        # --- Форма ---
         form = ttk.LabelFrame(self, text="  Новый документ / редактирование  ")
         form.pack(fill="x", padx=16, pady=6)
         inner = tk.Frame(form, bg=C["card"]); inner.pack(fill="x", padx=12, pady=10)
@@ -382,13 +452,19 @@ class App(tk.Tk):
             tk.Label(inner, text=label, bg=C["card"], fg=C["muted"], font=FONT_SMALL).grid(
                 row=r, column=c, sticky="w", padx=(6,4), pady=4)
             var = tk.StringVar(); self.vars[key] = var
-            e = ttk.Entry(inner, textvariable=var, width=w)
-            e.grid(row=r, column=c+1, sticky="ew", padx=(0,8), pady=4)
+            if key in ("sender", "case_name"):
+                cb = ttk.Combobox(inner, textvariable=var, width=w)
+                cb.grid(row=r, column=c+1, sticky="ew", padx=(0,8), pady=4)
+                cb.bind("<KeyRelease>", lambda e, k=key: self._update_autocomplete(k))
+                self._autocomplete_widgets[key] = cb
+            else:
+                e = ttk.Entry(inner, textvariable=var, width=w)
+                e.grid(row=r, column=c+1, sticky="ew", padx=(0,8), pady=4)
             if key in ("in_date", "remind_date"):
                 tk.Button(inner, text="📅", command=lambda v=var: DatePicker(self, v),
                           bg=C["accent"], fg="white", relief="flat", width=3,
                           cursor="hand2").grid(row=r, column=c+2, sticky="w", padx=(0,6))
-        # Статус
+
         tk.Label(inner, text="Статус", bg=C["card"], fg=C["muted"], font=FONT_SMALL).grid(
             row=2, column=4, sticky="w", padx=(6,4), pady=4)
         self.status_var = tk.StringVar(value="Новый")
@@ -408,13 +484,16 @@ class App(tk.Tk):
         ttk.Button(row_btns, text="🗑 В корзину", style="Danger.TButton",
                    command=self.delete_record).pack(side="left", padx=4)
 
-        # --- Сканирование ---
         scan_frame = ttk.LabelFrame(self, text="  Сканирование  ")
         scan_frame.pack(fill="x", padx=16, pady=6)
         s_inner = tk.Frame(scan_frame, bg=C["card"]); s_inner.pack(fill="x", padx=12, pady=10)
         self.scan_btn = ttk.Button(s_inner, text="📠 Сканировать", style="Accent.TButton",
                                    command=self.scan_current)
         self.scan_btn.pack(side="left", padx=(0,12))
+        tk.Label(s_inner, text="Формат:", bg=C["card"], fg=C["muted"], font=FONT_SMALL).pack(side="left")
+        self.format_var = tk.StringVar(value=SETTINGS.get("scan_format","JPG"))
+        ttk.Combobox(s_inner, textvariable=self.format_var,
+                     values=["JPG","PDF","PDF + JPG"], state="readonly", width=11).pack(side="left", padx=(0,10))
         tk.Label(s_inner, text="Размер:", bg=C["card"], fg=C["muted"], font=FONT_SMALL).pack(side="left")
         self.paper_var = tk.StringVar(value=SETTINGS.get("paper","A4 (210×297)"))
         ttk.Combobox(s_inner, textvariable=self.paper_var, values=list(PAPER_SIZES.keys()),
@@ -429,17 +508,19 @@ class App(tk.Tk):
                    command=self.open_scan).pack(side="left", padx=4)
         ttk.Button(s_inner, text="🗑 Удалить скан", style="Danger.TButton",
                    command=self.delete_scan).pack(side="left", padx=4)
+        ttk.Button(s_inner, text="🔎 OCR", style="Ghost.TButton",
+                   command=self.run_ocr_selected).pack(side="left", padx=4)
         ttk.Button(s_inner, text="📁 Папка", style="Ghost.TButton",
                    command=self.open_scans_folder).pack(side="left", padx=4)
         self.progress = ttk.Progressbar(s_inner, mode="indeterminate", length=120)
         self.progress.pack(side="left", padx=10)
 
-        # --- Поиск и сортировка ---
         tools = tk.Frame(self, bg=C["bg"]); tools.pack(fill="x", padx=16, pady=(6,2))
         tk.Label(tools, text="🔍 Поиск:", bg=C["bg"], fg=C["muted"], font=FONT_MAIN).pack(side="left")
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(tools, textvariable=self.search_var, width=30)
         self.search_entry.pack(side="left", padx=6)
+        self.search_entry.bind("<Return>", lambda e: self.load_data())
         ttk.Button(tools, text="Найти", style="Ghost.TButton", command=self.load_data).pack(side="left", padx=2)
         ttk.Button(tools, text="Сброс", style="Ghost.TButton", command=self.reset_search).pack(side="left", padx=2)
         ttk.Checkbutton(tools, text="Только без скана", variable=self.filter_noscan,
@@ -456,7 +537,6 @@ class App(tk.Tk):
             values=["▲ возр.","▼ убыв."], state="readonly", width=10)
         dc.pack(side="left", padx=2); dc.bind("<<ComboboxSelected>>", lambda e: self._apply_sort_from_combo())
 
-        # --- Таблица ---
         tree_frame = tk.Frame(self, bg=C["bg"])
         tree_frame.pack(fill="both", expand=True, padx=16, pady=(4,6))
         cols = ("id","in_number","in_date","sender","subject","case_name","status","executor","remind_date","scan")
@@ -479,7 +559,6 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", lambda e: self.open_scan())
 
-        # --- Низ: счётчик + печать ---
         bottom = tk.Frame(self, bg=C["bg"]); bottom.pack(fill="x", padx=16, pady=(2,10))
         self.counter = tk.Label(bottom, text="", bg=C["bg"], fg=C["muted"], font=FONT_SMALL)
         self.counter.pack(side="left")
@@ -496,23 +575,41 @@ class App(tk.Tk):
         self.bind("<F5>", lambda e: self.load_data())
         self.bind("<Delete>", lambda e: self.delete_record())
 
-    # ---------- Настройки / тема ----------
+    def _get_distinct(self, column):
+        rows = self.conn.execute(
+            f"SELECT DISTINCT {column} FROM documents WHERE deleted=0 AND {column} IS NOT NULL AND {column}<>'' ORDER BY {column}"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _update_autocomplete(self, key):
+        cb = self._autocomplete_widgets.get(key)
+        if not cb: return
+        text = self.vars[key].get().strip().lower()
+        values = self._get_distinct(key)
+        filtered = [v for v in values if text in v.lower()] if text else values
+        cb["values"] = filtered
+        if filtered and text and filtered[0].lower() != text:
+            cb.event_generate("<Down>")
+
     def toggle_theme(self):
         SETTINGS["theme"] = "dark" if SETTINGS.get("theme","light")=="light" else "light"
         save_settings(SETTINGS)
-        messagebox.showinfo("Тема", "Тема применена. Перезапустите программу, чтобы увидеть изменения.")
+        messagebox.showinfo("Тема","Тема применена. Перезапустите программу.")    # ---------- Настройки ----------
     def open_settings(self):
-        w = tk.Toplevel(self); w.title("Настройки"); w.geometry("480x280")
+        w = tk.Toplevel(self); w.title("Настройки"); w.geometry("520x320")
         w.configure(bg=C["bg"]); w.transient(self); w.grab_set()
         frm = tk.Frame(w, bg=C["card"]); frm.pack(fill="both", expand=True, padx=12, pady=12)
         tk.Label(frm, text="Папка сканов:", bg=C["card"], fg=C["muted"]).pack(anchor="w")
         scan_var = tk.StringVar(value=SCANS_DIR)
-        ttk.Entry(frm, textvariable=scan_var, width=50).pack(fill="x", pady=2)
+        ttk.Entry(frm, textvariable=scan_var, width=60).pack(fill="x", pady=2)
         tk.Label(frm, text="(изменение требует перезапуска)", bg=C["card"],
                  fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=(0,8))
         tk.Label(frm, text="Авто-бэкап каждые N дней (0 — выкл.):", bg=C["card"], fg=C["muted"]).pack(anchor="w")
         ab_var = tk.StringVar(value=str(SETTINGS.get("autobackup_days",7)))
         ttk.Entry(frm, textvariable=ab_var, width=8).pack(anchor="w", pady=2)
+        tk.Label(frm, text="Путь к Tesseract (для OCR):", bg=C["card"], fg=C["muted"]).pack(anchor="w", pady=(8,0))
+        tess_var = tk.StringVar(value=TESSERACT_PATH or "")
+        ttk.Entry(frm, textvariable=tess_var, width=60).pack(fill="x", pady=2)
         def save():
             try: SETTINGS["autobackup_days"] = int(ab_var.get())
             except: SETTINGS["autobackup_days"] = 7
@@ -531,6 +628,7 @@ class App(tk.Tk):
         if self.sort_col == key: self.sort_desc = not self.sort_desc
         else: self.sort_col = key; self.sort_desc = False
         self.load_data()
+
     def _apply_sort_from_combo(self):
         m = {"Дата":"in_date","Вх. №":"in_number","От кого":"sender","Дело":"case_name","Статус":"status"}
         self.sort_col = m.get(self.sort_field_var.get(),"in_date")
@@ -544,8 +642,8 @@ class App(tk.Tk):
         order = f"{self.sort_col} {'DESC' if self.sort_desc else 'ASC'}"
         where = ["deleted=0"]; params = []
         if q:
-            where.append("(in_number LIKE ? OR sender LIKE ? OR subject LIKE ? OR case_name LIKE ? OR executor LIKE ?)")
-            params += [f"%{q}%"]*5
+            where.append("(in_number LIKE ? OR sender LIKE ? OR subject LIKE ? OR case_name LIKE ? OR executor LIKE ? OR ocr_text LIKE ?)")
+            params += [f"%{q}%"]*6
         if self.filter_noscan.get():
             where.append("(scan_path IS NULL OR scan_path='')")
         sql = f"SELECT * FROM documents WHERE {' AND '.join(where)} ORDER BY {order}, id DESC"
@@ -553,13 +651,16 @@ class App(tk.Tk):
         total = self.conn.execute("SELECT COUNT(*) FROM documents WHERE deleted=0").fetchone()[0]
         withscan = self.conn.execute("SELECT COUNT(*) FROM documents WHERE deleted=0 AND scan_path IS NOT NULL AND scan_path<>''").fetchone()[0]
         for i, r in enumerate(rows):
-            # r: 0 id,1 num,2 date,3 sender,4 subj,5 case,6 note,7 status,8 exec,9 remind,10 created,11 scan,12 deleted
             scan_ok = "✔" if r[11] and any(os.path.exists(p) for p in r[11].split(";") if p) else ""
             tags = ["odd"] if i%2 else []
             st = r[7] or "Новый"
             tags.append({"Новый":"new","В работе":"work","Исполнен":"done","В архиве":"arch"}.get(st,"new"))
             self.tree.insert("", "end", values=(r[0],r[1],r[2],r[3],r[4],r[5],r[7] or "",r[8] or "",r[9] or "",scan_ok), tags=tuple(tags))
         self.counter.config(text=f"Всего: {total}   •   Со сканами: {withscan}   •   Без скана: {total-withscan}   •   Показано: {len(rows)}")
+        for k in ("sender", "case_name"):
+            if k in self._autocomplete_widgets:
+                self._autocomplete_widgets[k]["values"] = self._get_distinct(k)
+
     def reset_search(self):
         self.search_var.set(""); self.filter_noscan.set(False); self.load_data()
 
@@ -602,8 +703,8 @@ class App(tk.Tk):
         sel = self.tree.selection()
         if not sel: return
         vals = self.tree.item(sel[0],"values"); self.selected_id = int(vals[0])
-        keys = ["in_number","in_date","sender","subject","case_name"]
-        for k, val in zip(keys, vals[1:6]): self.vars[k].set(val)
+        for k, val in zip(["in_number","in_date","sender","subject","case_name"], vals[1:6]):
+            self.vars[k].set(val)
         self.vars["executor"].set(vals[7] if len(vals)>7 else "")
         self.vars["remind_date"].set(vals[8] if len(vals)>8 else "")
         self.status_var.set(vals[6] if len(vals)>6 else "Новый")
@@ -659,20 +760,74 @@ class App(tk.Tk):
         for old in glob.glob(prefix + "_*.jpg"):
             try: os.remove(old)
             except: pass
-        bw = self.bw_var.get(); dpi = int(self.dpi_var.get()); paper = self.paper_var.get()
-        SETTINGS["paper"]=paper; SETTINGS["dpi"]=str(dpi); SETTINGS["bw"]=bw; save_settings(SETTINGS)
+        for old in glob.glob(prefix + ".pdf"):
+            try: os.remove(old)
+            except: pass
+        bw = self.bw_var.get(); dpi = int(self.dpi_var.get())
+        paper = self.paper_var.get(); fmt = self.format_var.get()
+        SETTINGS["paper"]=paper; SETTINGS["dpi"]=str(dpi)
+        SETTINGS["bw"]=bw; SETTINGS["scan_format"]=fmt; save_settings(SETTINGS)
         self.scan_btn.config(state="disabled"); self.progress.start(12); self.update()
         try:
-            files = do_scan_jpg(prefix, bw, dpi, paper)
+            files = do_scan(prefix, bw, dpi, paper, fmt)
         finally:
             self.progress.stop(); self.scan_btn.config(state="normal")
         if files:
             self.conn.execute("UPDATE documents SET scan_path=? WHERE id=?", (";".join(files), self.selected_id))
-            self.conn.commit(); self.load_data()
-            if messagebox.askyesno("Готово", f"Сохранено страниц: {len(files)}.\n\nОткрыть просмотр?"):
+            self.conn.commit()
+            self._run_ocr_for(self.selected_id, files)
+            self.load_data()
+            if messagebox.askyesno("Готово", f"Сохранено файлов: {len(files)}.\n\nОткрыть просмотр?"):
                 self.open_scan()
         else:
             messagebox.showerror("Ошибка","Сканирование не выполнено.\nПроверьте Epson / TWAIN / WIA.")
+
+    def _run_ocr_for(self, doc_id, files):
+        if not TESSERACT_PATH:
+            messagebox.showwarning("OCR не настроен",
+                "Tesseract OCR не найден.\nУстановите его с https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "Поиск по содержимому скана будет недоступен.")
+            return
+        jpgs = []
+        for f in files:
+            if f.lower().endswith(".jpg"):
+                jpgs.append(f)
+            elif f.lower().endswith(".pdf"):
+                try:
+                    from pdf2image import convert_from_path
+                    pages = convert_from_path(f, dpi=200)
+                    base = os.path.splitext(f)[0]
+                    for i, pg in enumerate(pages, 1):
+                        tmp = f"{base}_ocr_{i}.jpg"
+                        pg.save(tmp, "JPEG", quality=85)
+                        jpgs.append(tmp)
+                except Exception as e:
+                    print("PDF->OCR error:", e)
+        if not jpgs: return
+        self.progress.start(12); self.update()
+        try:
+            texts = []
+            for f in jpgs:
+                t = ocr_image(f)
+                if t: texts.append(t)
+            if texts:
+                self.conn.execute("UPDATE documents SET ocr_text=? WHERE id=?",
+                                  ("\n---\n".join(texts), doc_id))
+                self.conn.commit()
+        finally:
+            self.progress.stop()
+
+    def run_ocr_selected(self):
+        if self.selected_id is None:
+            messagebox.showinfo("Инфо","Выберите запись."); return
+        row = self.conn.execute("SELECT scan_path FROM documents WHERE id=?", (self.selected_id,)).fetchone()
+        if not row or not row[0]:
+            messagebox.showinfo("Инфо","У записи нет скана."); return
+        files = [p for p in row[0].split(";") if p and os.path.exists(p)]
+        if not files:
+            messagebox.showinfo("Инфо","Файлы скана не найдены."); return
+        self._run_ocr_for(self.selected_id, files)
+        messagebox.showinfo("Готово","OCR выполнен. Поиск теперь ищет по содержимому.")
 
     def open_scan(self):
         if self.selected_id is None:
@@ -700,7 +855,7 @@ class App(tk.Tk):
             try:
                 if os.path.exists(f): os.remove(f); deleted += 1
             except Exception as e: errors.append(f"{os.path.basename(f)}: {e}")
-        self.conn.execute("UPDATE documents SET scan_path=NULL WHERE id=?", (self.selected_id,))
+        self.conn.execute("UPDATE documents SET scan_path=NULL, ocr_text=NULL WHERE id=?", (self.selected_id,))
         self.conn.commit(); self.load_data()
         msg = f"Удалено: {deleted}"
         if errors: msg += "\n\nОшибки:\n" + "\n".join(errors)
@@ -725,6 +880,7 @@ class App(tk.Tk):
             last = datetime.fromtimestamp(os.path.getmtime(backups[-1]))
             if (datetime.now() - last).days < days: return
         self.make_backup(silent=True)
+
     def make_backup(self, silent=False):
         default = os.path.join(BASE_DIR, f"backup_{datetime.now().strftime('%Y-%m-%d_%H%M')}.zip")
         path = filedialog.asksaveasfilename(defaultextension=".zip",
@@ -750,9 +906,9 @@ class App(tk.Tk):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f, delimiter=";")
-                w.writerow(["ID","Вх. №","Дата","От кого","Для чего","Дело","Примечание","Статус","Исполнитель","Напомнить","Создано","Скан"])
+                w.writerow(["ID","Вх. №","Дата","От кого","Для чего","Дело","Примечание","Статус","Исполнитель","Напомнить","Создано","Скан","OCR"])
                 for r in self.conn.execute("SELECT * FROM documents WHERE deleted=0 ORDER BY id").fetchall():
-                    w.writerow([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11]])
+                    w.writerow([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12] if len(r)>12 else ""])
             messagebox.showinfo("Готово", f"Экспортировано:\n{path}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Экспорт не удался: {e}")
@@ -764,21 +920,17 @@ class App(tk.Tk):
             count = 0
             with open(path, "r", encoding="utf-8-sig") as f:
                 reader = csv.reader(f, delimiter=";")
-                header = next(reader, None)
+                next(reader, None)
                 for row in reader:
                     if len(row) < 3: continue
                     self.conn.execute("""INSERT INTO documents
                         (in_number,in_date,sender,subject,case_name,note,status,executor,remind_date,created_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (row[1] if len(row)>1 else "",
-                         row[2] if len(row)>2 else "",
-                         row[3] if len(row)>3 else "",
-                         row[4] if len(row)>4 else "",
-                         row[5] if len(row)>5 else "",
-                         row[6] if len(row)>6 else "",
+                        (row[1] if len(row)>1 else "", row[2] if len(row)>2 else "",
+                         row[3] if len(row)>3 else "", row[4] if len(row)>4 else "",
+                         row[5] if len(row)>5 else "", row[6] if len(row)>6 else "",
                          row[7] if len(row)>7 and row[7] else "Новый",
-                         row[8] if len(row)>8 else "",
-                         row[9] if len(row)>9 else "",
+                         row[8] if len(row)>8 else "", row[9] if len(row)>9 else "",
                          datetime.now().isoformat(timespec="seconds")))
                     count += 1
             self.conn.commit(); self.load_data()
@@ -798,7 +950,8 @@ class App(tk.Tk):
             for k, v in [("Входящий номер",r[1]),("Дата",r[2]),("От кого",r[3]),
                          ("Для чего",r[4]),("Дело",r[5]),("Примечание",r[6]),
                          ("Статус",r[7]),("Исполнитель",r[8]),("Напомнить до",r[9])]:
-                p = doc.add_paragraph(); p.add_run(f"{k}: ").bold = True; p.add_run(str(v) if v else "—")
+                p = doc.add_paragraph(); p.add_run(f"{k}: ").bold = True
+                p.add_run(str(v) if v else "—")
             if r[11]:
                 p = doc.add_paragraph(); p.add_run("Скан: ").bold = True; p.add_run(r[11])
         else:
